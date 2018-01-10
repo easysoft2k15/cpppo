@@ -1525,6 +1525,11 @@ class Message_Router( Object ):
     FWD_OPEN_REQ		= 0x54
     FWD_OPEN_RPY		= FWD_OPEN_REQ | 0x80
 
+    FWD_CLOS_NAM		= "Forward Close"
+    FWD_CLOS_CTX		= "forward_close"
+    FWD_CLOS_REQ		= 0x4E
+    FWD_CLOS_RPY		= FWD_CLOS_REQ | 0x80
+
     ROUTE_FALSE			= 0	# Return False if invalid route
     ROUTE_RAISE			= 1	# Raise an Exception if invalid route
 
@@ -1800,6 +1805,49 @@ class Message_Router( Object ):
             result	       += b'\x00' # pad
             if app.size:
                 result	       += app.input
+
+        elif cls.FWD_CLOS_CTX in data and data.setdefault( 'service', cls.FWD_CLOS_REQ ) == cls.FWD_CLOS_REQ:
+            log.detail( "%s producing Forward Close Request: %s", cls.__name__, enip_format( data ))
+            result	       += USINT.produce( data.service )
+            result	       += EPATH.produce( data.path )
+            fc			= data.forward_close
+            result	       += USINT.produce( fc.priority_time_tick )
+            result	       += USINT.produce( fc.timeout_ticks )
+            result	       += UINT.produce( fc.connection_serial )
+            result	       += UINT.produce( fc.O_vendor )
+            result	       += UDINT.produce( fc.O_serial )
+            result	       += EPATH_padded.produce( fc.connection_path )
+
+        elif data.get( 'service' ) == cls.FWD_CLOS_RPY:
+            log.detail( "%s producing Forward Close Reply: %s", cls.__name__, enip_format( data ))
+            result	       += USINT.produce( data.service )
+            result	       += b'\x00' # reserved
+            result	       += status.produce( data )
+            fc			= data.forward_close
+            result	       += UINT.produce( fc.connection_serial )
+            result	       += UINT.produce( fc.O_vendor )
+            result	       += UDINT.produce( fc.O_serial )
+
+            # The forward_close.application data in the reply is typed data, by default USINT.  It
+            # must be an even number of bytes, so pad it out if not.
+            app			= fc.setdefault( 'application', dotdict() )
+            if 'data' not in app:
+                app.data	= []
+            if app.data:
+                # Something has been provided
+                if 'type' not in app and 'tag_type' not in app:
+                    app.tag_type= USINT.tag_type
+                app.input	= typed_data.produce( app )
+                if len( app.input ) % 2:
+                    app.input  += b'\x00'
+                app.size	= len( app.input ) // 2 # words
+            else:
+                app.size	= 0
+
+            result	       += USINT.produce( app.size ) # application data size (words)
+            result	       += b'\x00' # pad
+            if app.size:
+                result	       += app.input
         else:
             result		= super( Message_Router, cls ).produce( data )
 
@@ -2000,6 +2048,7 @@ def __forward_open():
     otncp[True]		= torpi	= UDINT(		context='forward_open', extension='.T_O_RPI' )
     torpi[True]		= toncp	= WORD(			context='forward_open', extension='.T_O_NCP' )
     toncp[True]		= tclt	= USINT( 		context='forward_open', extension='.transport_class_triggers' )
+    # 33 bytes from Path to start of Connection Path Size; Connection Path begins on a Word boundary
     tclt[True]		= cpth	= EPATH(	 	context='forward_open', extension='.connection_path',
                                                     terminal=True )
     return srvc
@@ -2043,6 +2092,59 @@ def __forward_open_reply():
 Message_Router.register_service_parser( number=Message_Router.FWD_OPEN_RPY, name=Message_Router.FWD_OPEN_NAM + " Reply",
                                         short=Message_Router.FWD_OPEN_CTX, machine=__forward_open_reply() )
 
+
+def __forward_close():
+    """Handle Forward Close request.  Note that the Connection Path Size / Connection Path has a pad byte (vs. 
+    Forward Open, which does not).
+    """
+    srvc			= USINT(	 	context='service' )
+    srvc[True]		= path	= EPATH(		context='path')
+    path[True]		= prio	= USINT(		context='forward_close', extension='.priority_time_tick' )
+    prio[True]		= timo	= USINT(		context='forward_close', extension='.timeout_ticks' )
+    timo[True]		= cser	= UINT(			context='forward_close', extension='.connection_serial' )
+    cser[True]		= ovnd	= UINT(			context='forward_close', extension='.O_vendor' )
+    ovnd[True]		= oser	= UDINT(		context='forward_close', extension='.O_serial' )
+    # 10 bytes from Path to start of Connection Path Size; a pad byte is required for Connection Path
+    # to begin on a Word boundary.
+    oser[True]		= cpth	= EPATH_padded(	 	context='forward_close', extension='.connection_path',
+                                                    terminal=True )
+    return srvc
+
+Message_Router.register_service_parser( number=Message_Router.FWD_CLOS_REQ, name=Message_Router.FWD_CLOS_NAM,
+                                        short=Message_Router.FWD_CLOS_CTX, machine=__forward_close() )
+
+
+def __forward_close_reply():
+    srvc			= USINT(	context='service' )
+    srvc[True]		= rsvd	= octets_drop(	'reserved',	repeat=1 )
+    rsvd[True]		= stts	= status()
+    stts[True]		= cser	= UINT(			context='forward_close', extension='.connection_serial' )
+    cser[True]		= ovnd	= UINT(			context='forward_close', extension='.O_vendor' )
+    ovnd[True]		= oser	= UDINT(		context='forward_close', extension='.O_serial' )
+    oser[True]		= rsiz	= USINT(		context='forward_close', extension='.application_size' )
+    rsiz[True]		= rsvd	= octets_drop(		'pad', repeat=1 )
+
+    # Parse all segments in a sub-dfa limited by the parsed application.size (in words; double) If
+    # the size is zero, we won't be parsing anything; initialize data to [].  Also moves the parsed
+    # .application_size into application.size.  Triggers only if there is data following the pad.
+    def size_data( path=None, data=None, **kwds ):
+        app			= data[path].setdefault( 'application', {} )
+        app.size		= data[path].pop( 'application_size' )
+        octets			= app.size * 2
+        if not octets:
+            app.data		= []
+        return octets
+
+    rsvd[None]			= cpppo.dfa(    'data',		context='forward_close',
+                                                initial=typed_data(
+                                                    context='application', tag_type=USINT.tag_type,
+                                                    terminal=True ),
+                                                limit=size_data,
+                                                terminal=True )
+    return srvc
+
+Message_Router.register_service_parser( number=Message_Router.FWD_CLOS_RPY, name=Message_Router.FWD_CLOS_NAM + " Reply",
+                                        short=Message_Router.FWD_CLOS_CTX, machine=__forward_close_reply() )
 
 
 class Connection_Manager( Object ):

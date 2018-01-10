@@ -635,6 +635,11 @@ class client( object ):
                 sender_context=sender_context )
         return req
 
+    def forward_close( self, path, connection_path,
+                      priority_time_tick, timeout_ticks,
+                      O_serial, O_vendor, connection_serial ):
+        pass
+
     def service_code( self, code, path, data=None, elements=None, tag_type=None,
                 route_path=None, send_path=None, timeout=None, send=True,
                 sender_context=b'', data_size=None ): # response data_size estimation
@@ -1528,8 +1533,11 @@ class implicit( connector ):
     specialized for the given 'configuration' name (defaults to "Originator", if None, falling back
     to "DEFAULT" if not found).
 
-    After successful establishment, the 'implicit' instance's 'established' attribute will contain the 
-    successful Forward Open response.
+    After successful establishment, the 'implicit' instance's 'self.established' attribute will
+    contain the successful Forward Open response; 'self.requested' will contain the original forward
+    Open request, and 'self.timeout' will contain the original timeout.  These will be used to issue
+    the correct Forward Close request at the close of the session.
+
     """
     connection_serial		= 0
     def __init__( self, host, port=None, timeout=None, connection_path=None, path=None, 
@@ -1580,7 +1588,7 @@ class implicit( connector ):
             with self:
                 # The forward_open( timeout=... ) applies to the socket send only
                 elapsed_req	= cpppo.timer() - begun
-                self.forward_open(
+                self.requested	= self.forward_open(
                     path		= path,
                     connection_path	= connection_path,
                     priority_time_tick	= priority_time_tick,
@@ -1608,9 +1616,11 @@ class implicit( connector ):
                 log.detail( "Forward Open Reply: %s", enip.enip_format( data ))
             assert 'enip.status' in data, "Failed to receive EtherNet/IP response"
             assert data.enip.status == 0, "EtherNet/IP response indicates failure: %s" % data.enip.status
-            self.established	= data.get( 'enip.CIP.send_data.CPF.item[1].unconnected_send.request' )
+            self.established		= data.get( 'enip.CIP.send_data.CPF.item[1].unconnected_send.request' )
             assert self.established and 'forward_open' in self.established and self.established.status == 0, \
                 "Failed to receive successful Forward Open response: %s" % ( enip_format( self.established ))
+            self.timeout		= timeout
+            
         except Exception as exc:
             log.normal( "FwdOpen:  Failure in %7.3fs/%7.3fs: %s", cpppo.timer() - begun,
                         cpppo.inf if timeout is None else timeout, exc )
@@ -1619,6 +1629,48 @@ class implicit( connector ):
             log.normal( "FwdOpen:  Success in %7.3fs/%7.3fs", cpppo.timer() - begun,
                         cpppo.inf if timeout is None else timeout )
 
+    def close( self ):
+        """Attempt to cleanly close the Implicit Forward Opened connection by sending a corresponding
+        Forward Close.  If it fails, capture and log the failure, but continue with the close, as
+        this is often executed as part of the destruction of a connection.  We will use the values
+        returned in the Forward Open response saved in self.established, and the original
+        connection_path saved in self.connection_path.
+
+        Since we can't have a constructed object unless the original Forward Open succeeded, we can
+        assume that we must perform the Forward Close.  If the socket has already been closed, this
+        will fail immediately.
+
+        """
+        begun			= cpppo.timer()
+        try:
+            with self:
+                self.forward_close(
+                    path		= self.requested.path['segment'],
+                    connection_path	= self.requested.connection_path['segment'],
+                    O_serial		= self.established.forward_open.O_serial,
+                    O_vendor		= self.established.forward_open.O_vendor,
+                    connection_serial	= self.established.forward_open.connection_serial )
+                # Await the CIP response for remainder of timeout
+                elapsed_req	= cpppo.timer() - begun
+                data,elapsed_rpy= await( self, timeout=None if timeout is None else max( 0, timeout - elapsed_req ))
+            assert data is not None, "Failed to receive any response"
+            if log.isEnabledFor( logging.DETAIL ):
+                log.detail( "Forward Close Reply: %s", enip.enip_format( data ))
+            assert 'enip.status' in data, "Failed to receive EtherNet/IP response"
+            assert data.enip.status == 0, "EtherNet/IP response indicates failure: %s" % data.enip.status
+            response			= data.get( 'enip.CIP.send_data.CPF.item[1].unconnected_send.request' )
+            assert 'forward_close' in self.established and self.established.status == 0, \
+                "Failed to receive successful Forward Open response: %s" % ( enip_format( self.established ))
+            
+        except Exception as exc:
+            log.normal( "FwdClose: Failure in %7.3fs/%7.3fs: %s", cpppo.timer() - begun,
+                        cpppo.inf if timeout is None else timeout, exc )
+            raise
+        else:
+            log.normal( "FwdClose: Success in %7.3fs/%7.3fs", cpppo.timer() - begun,
+                        cpppo.inf if timeout is None else timeout )
+            
+        super( implicit, self ).close()
 
 
 def recycle( iterable, times=None ):
