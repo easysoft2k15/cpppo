@@ -307,7 +307,7 @@ class proxy( object ):
             ( log.warning if exc else log.normal )(
                 "Closed EtherNet/IP CIP gateway %s due to: %s%s",
                 self.gateway, exc or "(unknown)",
-                "" if log.getEffectiveLevel() > logging.INFO
+                "" if log.getEffectiveLevel() > logging.INFO # is below INFO
                 else ''.join( traceback.format_exc() ))
             self.gateway	= None
             self.identity	= self.identity_default

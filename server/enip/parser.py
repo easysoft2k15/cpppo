@@ -571,8 +571,7 @@ class move_if( cpppo.decide ):
                 try:
                     data[pathdst]= ini
                 finally:
-                    if log.getEffectiveLevel() <= logging.DEBUG:
-                        log.debug( "%s -- init. data[%r] to %r in data: %s", self, pathdst, ini, data )
+                    log.debug( "%s -- init. data[%r] to %r in data: %s", self, pathdst, ini, data )
             if self.src is not None:
                 pathsrc		= path + self.src
                 # assert pathsrc in data, \
@@ -584,13 +583,11 @@ class move_if( cpppo.decide ):
                 dst		= data[pathdst]
                 if hasattr( dst, 'append' ):
                     # We're supposed to append to an existing destination list-like thing...
-                    if log.getEffectiveLevel() <= logging.DEBUG:
-                        log.debug( "%s -- append data[%r] == %r to data[%r]", self, pathsrc, src, pathdst )
+                    log.debug( "%s -- append data[%r] == %r to data[%r]", self, pathsrc, src, pathdst )
                     dst.append( src )
                 else:
                     # We're supposed to replace an existing destination object
-                    if log.getEffectiveLevel() <= logging.DEBUG:
-                        log.debug( "%s -- assign data[%r] == %r to data[%r]", self, pathsrc, src, pathdst )
+                    log.debug( "%s -- assign data[%r] == %r to data[%r]", self, pathsrc, src, pathdst )
                     data[pathdst] = src
 
         return target
@@ -1355,8 +1352,8 @@ class CPF( cpppo.dfa ):
         .CPF.item[0].length		UINT		2	Length of item encapsulated
         .CPF.item[0].<parser>...
 
-    Parse the count, and then each CPF item into cpf.item_temp, and (after parsing) moves it to
-    cpf.item[x].  If count is 0, then no items are parsed, and an empty item == [] list is returned.
+    Parse the count, and then each CPF item into CPF.item_temp, and (after parsing) moves it to
+    CPF.item[x].  If count is 0, then no items are parsed, and an empty item == [] list is returned.
     
 
     A dictionary of parsers for various CPF types must be provided.  Any CPF item with a length > 0

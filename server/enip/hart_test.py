@@ -472,7 +472,7 @@ def test_CIP_HART( repeat=1 ):
             log.normal( "EtherNet/IP Request: Empty (session terminated): %s", enip.enip_format( data ))
             continue
 
-        if log.getEffectiveLevel() <= logging.NORMAL:
+        if log.isEnabledFor( logging.NORMAL ):
             log.normal( "EtherNet/IP Request: %s", enip.enip_format( data ))
             
         # Parse the encapsulated .input
@@ -481,7 +481,7 @@ def test_CIP_HART( repeat=1 ):
                 log.detail( "%s #%3d -> %10.10s; next byte %3d: %-10.10r: %r",
                           machine.name_centered(), i, s, source.sent, source.peek(), data )
 
-        if log.getEffectiveLevel() <= logging.NORMAL:
+        if log.isEnabledFor( logging.NORMAL ):
             log.normal( "EtherNet/IP CIP Request: %s", enip.enip_format( data ))
 
         # Assume the request in the CIP's CPF items are HART requests.
@@ -492,7 +492,7 @@ def test_CIP_HART( repeat=1 ):
                     # An Unconnected Send that contained an encapsulated request (ie. not just a Get
                     # Attribute All)
                     with MR.parser as machine:
-                        if log.getEffectiveLevel() <= logging.NORMAL:
+                        if log.isEnabledFor( logging.NORMAL ):
                             log.normal( "Parsing %3d bytes using %s.parser, from %s", 
                                         len( item.unconnected_send.request.input ),
                                         MR, enip.enip_format( item ))
@@ -504,7 +504,7 @@ def test_CIP_HART( repeat=1 ):
                             log.detail( "%s #%3d -> %10.10s; next byte %3d: %-10.10r: %r",
                                         machine.name_centered(), i, s, source.sent, source.peek(), data )
                     # Post-processing of some parsed items is only performed after lock released!
-                    if log.getEffectiveLevel() <= logging.NORMAL:
+                    if log.isEnabledFor( logging.NORMAL ):
                         log.normal( "Parsed  %3d bytes using %s.parser, into %s", 
                                     len( item.unconnected_send.request.input ),
                                     MR, enip.enip_format( data ))

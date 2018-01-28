@@ -23,8 +23,8 @@ if __name__ == "__main__":
     # running tests directly
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
     from cpppo.automata import log_cfg
+    #log_cfg['level'] 		= logging.INFO
     logging.basicConfig( **log_cfg )
-    #logging.getLogger().setLevel( logging.INFO )
 
 from ...dotdict import dotdict, apidict
 from ... import misc, tools
@@ -116,6 +116,7 @@ def test_client_timeout():
 
 def test_client_api_simple():
     logging.getLogger().setLevel( logging.DETAIL )
+    #logging.getLogger().setLevel( logging.DEBUG )
 
     taglen			= 100 # able to fit request for Attribute into 1 packet
 

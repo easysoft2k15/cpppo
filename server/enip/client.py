@@ -422,6 +422,13 @@ class client( object ):
         The response may not actually contain a payload, eg. if the EtherNet/IP header contains a
         non-zero status.
 
+        TODO: Defer parsing of CPF items in response payload to caller; only the caller knows the
+        corresponding request, and hence the correct CIP Object that knows how to parse the
+        request's reply! For example, a "Forward Open" is known to the Connection_Manager @6/1,
+        while most I/O requests (eg. "Get Attribute Single", "Read Tag Fragmented") are known to the
+        device-specific dialect of Message Router (eg. Logix). The request has the .path component
+        that identifies this Object...
+
         """
         # Ensure that the caller has gained exclusive access to this client instance using:
         # 
@@ -632,7 +639,7 @@ class client( object ):
         if send:
             self.unconnected_send(
                 request=req, route_path=route_path, send_path=send_path, timeout=timeout,
-                sender_context=sender_context )
+                sender_context=sender_context, dialect=device.Connection_Manager )
         return req
 
     def forward_close( self, path, connection_path,
@@ -820,11 +827,16 @@ class client( object ):
         return req
 
     def unconnected_send( self, request, route_path=None, send_path=None, timeout=None,
-                          sender_context=b'' ):
+                          sender_context=b'', dialect=None ):
         """The default route_path is the CPU in chassis (link 0), port 1, and the default send_path is
         to its Connection Manager (Class 6, Instance 1).  These defaults can be configured on a
         class or per-instance basis by changing the {route,send}_path_default attributes in either
         the client class or instance.
+
+        If a specific dialect of CIP Object is required to parse/produce the message, pass it;
+        otherwise, the global device.dialect will be used. For example; only Connection_Manager type
+        Objects can understand Forward Open/Close requests. Otherwise, it is probably a
+        Message_Router type CIP Object that is required to parse the payload.
 
         """
         # Default route_path to the CPU in chassis (link 0), port 1.  If provided route_path is
@@ -836,6 +848,8 @@ class client( object ):
         if send_path is None: # could be a string path to parse or a list
             # Default to the Connection Manager
             send_path		= self.send_path_default
+        if dialect is None:
+            dialect		= device.dialect
 
         cip			= cpppo.dotdict()
         cip.send_data		= {}
@@ -865,10 +879,11 @@ class client( object ):
                 us.route_path	= { 'segment': [ cpppo.dotdict( s ) for s in route_path ]} # must be {link/port}
 
         # If the paylaod is an opaque byte string, just pass it thru (we probably don't know how to
-        # en/decode it, eg. raw PCCC requests, etc.).  However, if dict is provided, we'll try (the usual case).
+        # en/decode it, eg. raw PCCC requests, etc.).  However, if dict is provided, we'll try (the
+        # usual case).
         if isinstance( request, dict ):
             us.request		= request
-            us.request.input	= bytearray( device.dialect.produce( us.request )) # eg. logix.Logix
+            us.request.input	= bytearray( dialect.produce( us.request )) # eg. logix.Logix
         else:
             us.request		= {}
             us.request.input	= bytearray( request or b'' )
@@ -878,7 +893,7 @@ class client( object ):
 
     def connected_send( self, request, timeout=None,
                         connection=None, sequence=None, payload=None,
-                        sender_context=b'' ):
+                        sender_context=b'', dialect=None ):
         """A connected send is much like an unconnected_send, except its CPF contains a 0x00a1 connection
         ID, and a 0x00b1 data sequence number and payload.  Defaults to 0 connection ID, 0 sequence
         number, empty payload; the caller should increment sequence between calls.
@@ -889,8 +904,10 @@ class client( object ):
         """
         # The payload is an opaque byte string; we probably don't know how to en/decode it.
         # However, if dict is provided, we'll try.
+        if dialect is None:
+            dialect		= device.dialect
         if isinstance( request, dict ):
-            payload		= bytearray( device.dialect.produce( request ))
+            payload		= bytearray( dialect.produce( request ))
         else:
             payload		= bytearray( request or b'' )
 
@@ -1548,6 +1565,9 @@ class implicit( connector ):
                   route_path=False, send_path='', # typically no 0x52 encapsulation w/ routing for fwd open
                   **kwds ):
         begun			= cpppo.timer()
+        self.timeout		= timeout
+        self.requested		= cpppo.dotdict()
+        self.established	= cpppo.dotdict()
         try:
             super( implicit, self ).__init__( host=host, port=port, timeout=timeout, **kwds )
             assert not self.udp, "Cannot establish Implicit UDP EtherNet/IP CIP connections"
@@ -1604,7 +1624,7 @@ class implicit( connector ):
                     connection_serial	= connection_serial,
                     transport_class_triggers = transport_class_triggers,
                     connection_timeout_multiplier = connection_timeout_multiplier,
-                    timeout=None if timeout is None else max( 0, timeout - elapsed_req ),
+                    timeout		= None if timeout is None else max( 0, timeout - elapsed_req ),
                     route_path		= route_path,
                     send_path		= send_path )
                 # Await the CIP response for remainder of timeout
@@ -1618,8 +1638,7 @@ class implicit( connector ):
             assert data.enip.status == 0, "EtherNet/IP response indicates failure: %s" % data.enip.status
             self.established		= data.get( 'enip.CIP.send_data.CPF.item[1].unconnected_send.request' )
             assert self.established and 'forward_open' in self.established and self.established.status == 0, \
-                "Failed to receive successful Forward Open response: %s" % ( enip_format( self.established ))
-            self.timeout		= timeout
+                "Failed to receive successful Forward Open response: %s" % ( enip.enip_format( self.established ))
             
         except Exception as exc:
             log.normal( "FwdOpen:  Failure in %7.3fs/%7.3fs: %s", cpppo.timer() - begun,
@@ -1643,6 +1662,8 @@ class implicit( connector ):
         """
         begun			= cpppo.timer()
         try:
+            assert 'forward_open' in self.established and self.established.forward_open.status == 0, \
+                "No Forward Open; not executing Forward Close"
             with self:
                 self.forward_close(
                     path		= self.requested.path['segment'],
@@ -1650,9 +1671,9 @@ class implicit( connector ):
                     O_serial		= self.established.forward_open.O_serial,
                     O_vendor		= self.established.forward_open.O_vendor,
                     connection_serial	= self.established.forward_open.connection_serial )
-                # Await the CIP response for remainder of timeout
+                # Await the CIP response for remainder of self.timeout
                 elapsed_req	= cpppo.timer() - begun
-                data,elapsed_rpy= await( self, timeout=None if timeout is None else max( 0, timeout - elapsed_req ))
+                data,elapsed_rpy= await( self, timeout=None if self.timeout is None else max( 0, self.timeout - elapsed_req ))
             assert data is not None, "Failed to receive any response"
             if log.isEnabledFor( logging.DETAIL ):
                 log.detail( "Forward Close Reply: %s", enip.enip_format( data ))
@@ -1664,13 +1685,13 @@ class implicit( connector ):
             
         except Exception as exc:
             log.normal( "FwdClose: Failure in %7.3fs/%7.3fs: %s", cpppo.timer() - begun,
-                        cpppo.inf if timeout is None else timeout, exc )
+                        cpppo.inf if self.timeout is None else self.timeout, exc )
             raise
         else:
             log.normal( "FwdClose: Success in %7.3fs/%7.3fs", cpppo.timer() - begun,
-                        cpppo.inf if timeout is None else timeout )
-            
-        super( implicit, self ).close()
+                        cpppo.inf if self.timeout is None else self.timeout )
+        finally:
+            super( implicit, self ).close()
 
 
 def recycle( iterable, times=None ):

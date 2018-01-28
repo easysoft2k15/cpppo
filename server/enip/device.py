@@ -636,12 +636,15 @@ class Object( object ):
 
     """
     max_instance		= 0
-    lock			= threading.Lock()
+
+    # A derived class may specify its own parser and lock (and service, transit, used for logging)
+    # This would be necessary if the same service numbers are used for different services.
     service			= {} # Service number/name mappings
     transit			= {} # Symbol to transition to service parser on
 
     # The parser doesn't add a layer of context; run it with a path= keyword to add a layer
-    parser			= automata.dfa_post( service, initial=automata.state( 'sel svc' ),
+    lock			= threading.Lock()
+    parser			= automata.dfa_post( service, initial=automata.state( 'Obj svc' ),
                                                   terminal=True )
     # No config, by default (use default values).  Allows ${<section>:<key>} interpolation, and
     # comments anywhere via the # symbol (this implies no # allowed in any value, due to the lack of
@@ -659,23 +662,25 @@ class Object( object ):
     @classmethod
     def register_service_parser( cls, number, name, short, machine ):
         """Registers a parser with the Object.  May be invoked during import; no logging.  Allows a single
-        "default" parser w/ number == True to be defined.
+        "default" parser w/ number == True to be defined. So, use our parser's .encode() method to
+        process the number, to convert True/None to state.ALL/NON
 
         """
-        assert number not in cls.service, \
+        enc			= cls.parser.encode( number )
+        assert enc not in cls.service, \
             "Duplicate service #%s: %r number registered for Object %s" % ( number, name, cls.__name__ )
         assert name not in cls.service, \
             "Duplicate service #%s: %r name   registered for Object %s" % ( number, name, cls.__name__ )
 
-        cls.service[number]	= name
-        cls.service[name]	= number
-        cls.transit[number]	= ( chr( number )
-                                    if sys.version_info[0] < 3 and number is not None
-                                    else number )
-        cls.parser.initial[cls.transit[number]] \
+        cls.service[enc]	= name
+        cls.service[name]	= enc
+        cls.transit[enc]	= ( chr( enc )
+                                    if sys.version_info[0] < 3 and enc >= 0
+                                    else enc )
+        cls.parser.initial[cls.transit[enc]] \
 				= automata.dfa( name=short, initial=machine, terminal=True )
         
-        print( "%s.parser.initial[%s] == %s" % ( cls, cls.transit[number], cls.parser.initial[cls.transit[number]] ))
+        print( "%s.parser.initial[%s] == %s" % ( cls, cls.transit[enc], cls.parser.initial[cls.transit[enc]] ))
     
     GA_ALL_NAM			= "Get Attributes All"
     GA_ALL_CTX			= "get_attributes_all"
@@ -823,7 +828,7 @@ class Object( object ):
                  or self.SA_SNG_CTX in data and data.setdefault( 'service', self.SA_SNG_REQ ) == self.SA_SNG_REQ ):
                 pass
             else:
-                raise AssertionError( "Unrecognized Service Request" )
+                raise AssertionError( "Unrecognized Service Request: %s" % enip_format( data ))
 
             # A recognized Set/Get Attribute[s] {Single/All} request; process the request data
             # artifact, converting it into a reply.  All of these requests produce/consume a
@@ -953,7 +958,7 @@ class Object( object ):
                 result	       += typed_data.produce(	data.service_code,
                                                         tag_type=USINT.tag_type )
         else:
-            assert False, "%s doesn't recognize request/reply format: %r" % ( cls.__name__, data )
+            raise AssertionError( "%s doesn't recognize request/reply format: %r" % ( cls.__name__, data ))
         return result
 
 # Register the standard Object parsers
@@ -973,7 +978,7 @@ def __service_code_reply():
                                                 terminal=True )
     return srvc
     
-Object.register_service_parser( number=None, name=Object.SV_COD_NAM, 
+Object.register_service_parser( number=True, name=Object.SV_COD_NAM, 
                                 short=Object.SV_COD_CTX, machine=__service_code_reply() )
 
 def __get_attributes_all():
@@ -1520,16 +1525,6 @@ class Message_Router( Object ):
     MULTIPLE_REQ		= 0x0A
     MULTIPLE_RPY		= MULTIPLE_REQ | 0x80
 
-    FWD_OPEN_NAM		= "Forward Open"
-    FWD_OPEN_CTX		= "forward_open"
-    FWD_OPEN_REQ		= 0x54
-    FWD_OPEN_RPY		= FWD_OPEN_REQ | 0x80
-
-    FWD_CLOS_NAM		= "Forward Close"
-    FWD_CLOS_CTX		= "forward_close"
-    FWD_CLOS_REQ		= 0x4E
-    FWD_CLOS_RPY		= FWD_CLOS_REQ | 0x80
-
     ROUTE_FALSE			= 0	# Return False if invalid route
     ROUTE_RAISE			= 1	# Raise an Exception if invalid route
 
@@ -1580,19 +1575,14 @@ class Message_Router( Object ):
         if self.MULTIPLE_CTX in data and data.setdefault( 'service', self.MULTIPLE_REQ ) == self.MULTIPLE_REQ:
             # Multiple Service Packet Request; '.multiple' required
             pass
-            '''
-        elif self.FWD_OPEN_CTX in data and data.setdefault( 'service', self.FWD_OPEN_REQ ) == self.FWD_OPEN_REQ:
-            # Forward Open
-            pass
-            '''
         else:
             # Not recognized; more generic command?
             return super( Message_Router, self ).request( data )
 
-        # It is a Forward Open or Multiple Service Packet request; turn it into a reply.  Any
-        # exception processing one of the sub-requests will fail this request; normally, the
-        # sub-request should just return a non-zero Response Status in its payload...  If we cannot
-        # successfully iterate the request payload, return a generic Service not supported.
+        # It is a Multiple Service Packet request; turn it into a reply.  Any exception processing
+        # one of the sub-requests will fail this request; normally, the sub-request should just
+        # return a non-zero Response Status in its payload...  If we cannot successfully iterate the
+        # request payload, return a generic Service not supported.
         data.service	       |= 0x80
         try:
             data.status		= 0x16			# Object does not exist, if path invalid
@@ -1620,15 +1610,8 @@ class Message_Router( Object ):
                         log.detail( "%s Process on %s: %s", self, target, enip_format( r ))
                     target.request( r )
                 data.status	= 0x00
-            '''
-            elif data.service == self.FWD_OPEN_RPY:
-                # The target object must have a 'forward_open' implementation, and must convert the
-                # supplied 'data' dotdict request into a response; data.service is already Forward Open Reply, and the status
-                # defaults to an error -- we expect it to be converted to a  .  We'll take care of serializing the
-                # Forward Open response.
-                data.status	= 8			# Service not supported, if anything blows up
-                target.forward_open( data )
-            '''
+            else:
+                raise AssertionError( "Unknown service code %s" % data.service )
 
         except Exception as exc:
             # On Exception, if we haven't specified a more detailed error code, return General
@@ -1639,7 +1622,7 @@ class Message_Router( Object ):
                          ( self.service[data.service]
                            if 'service' in data and data.service in self.service
                            else "(Unknown)"), exc, enip_format( data ),
-                         ( '' if log.getEffectiveLevel() >= logging.NORMAL
+                         ( '' if log.getEffectiveLevel() >= logging.NORMAL # is at/below NORMAL
                            else ''.join( traceback.format_exception( *sys.exc_info() ))))
             assert data.status, \
                 "Implementation error: must specify non-zero .status before raising Exception!"
@@ -1750,115 +1733,17 @@ class Message_Router( Object ):
                 for o in offsets:
                     result     += UINT.produce( 	2 + 2 * len( offsets ) + o )
                 result	       += rpydata
-        elif cls.FWD_OPEN_CTX in data and data.setdefault( 'service', cls.FWD_OPEN_REQ ) == cls.FWD_OPEN_REQ:
-            log.detail( "%s producing Forward Open Request: %s", cls.__name__, enip_format( data ))
-            result	       += USINT.produce( data.service )
-            result	       += EPATH.produce( data.path )
-            fo			= data.forward_open
-            result	       += USINT.produce( fo.priority_time_tick )
-            result	       += USINT.produce( fo.timeout_ticks )
-            result	       += UDINT.produce( fo.O_T_connection_ID )
-            result	       += UDINT.produce( fo.T_O_connection_ID )
-            result	       += UINT.produce( fo.connection_serial )
-            result	       += UINT.produce( fo.O_vendor )
-            result	       += UDINT.produce( fo.O_serial )
-            result	       += USINT.produce( fo.connection_timeout_multiplier )
-            result	       += b'\x00' * 3 # reserved
-            result	       += UDINT.produce( fo.O_T_RPI )
-            result	       += WORD.produce( fo.O_T_NCP )
-            result	       += UDINT.produce( fo.T_O_RPI )
-            result	       += WORD.produce( fo.T_O_NCP )
-            result	       += USINT.produce( fo.transport_class_triggers )
-            result	       += EPATH.produce( fo.connection_path )
-
-        elif data.get( 'service' ) == cls.FWD_OPEN_RPY:
-            log.detail( "%s producing Forward Open Reply: %s", cls.__name__, enip_format( data ))
-            result	       += USINT.produce( data.service )
-            result	       += b'\x00' # reserved
-            result	       += status.produce( data )
-            fo			= data.forward_open
-            result	       += UDINT.produce( fo.O_T_connection_ID )
-            result	       += UDINT.produce( fo.T_O_connection_ID )
-            result	       += UINT.produce( fo.connection_serial )
-            result	       += UINT.produce( fo.O_vendor )
-            result	       += UDINT.produce( fo.O_serial )
-            result	       += UDINT.produce( fo.O_T_API )
-            result	       += UDINT.produce( fo.T_O_API )
-
-            # The forward_open.application data in the reply is typed data, by default USINT.  It
-            # must be an even number of bytes, so pad it out if not.
-            app			= fo.setdefault( 'application', dotdict() )
-            if 'data' not in app:
-                app.data	= []
-            if app.data:
-                # Something has been provided
-                if 'type' not in app and 'tag_type' not in app:
-                    app.tag_type= USINT.tag_type
-                app.input	= typed_data.produce( app )
-                if len( app.input ) % 2:
-                    app.input  += b'\x00'
-                app.size	= len( app.input ) // 2 # words
-            else:
-                app.size	= 0
-
-            result	       += USINT.produce( app.size ) # application data size (words)
-            result	       += b'\x00' # pad
-            if app.size:
-                result	       += app.input
-
-        elif cls.FWD_CLOS_CTX in data and data.setdefault( 'service', cls.FWD_CLOS_REQ ) == cls.FWD_CLOS_REQ:
-            log.detail( "%s producing Forward Close Request: %s", cls.__name__, enip_format( data ))
-            result	       += USINT.produce( data.service )
-            result	       += EPATH.produce( data.path )
-            fc			= data.forward_close
-            result	       += USINT.produce( fc.priority_time_tick )
-            result	       += USINT.produce( fc.timeout_ticks )
-            result	       += UINT.produce( fc.connection_serial )
-            result	       += UINT.produce( fc.O_vendor )
-            result	       += UDINT.produce( fc.O_serial )
-            result	       += EPATH_padded.produce( fc.connection_path )
-
-        elif data.get( 'service' ) == cls.FWD_CLOS_RPY:
-            log.detail( "%s producing Forward Close Reply: %s", cls.__name__, enip_format( data ))
-            result	       += USINT.produce( data.service )
-            result	       += b'\x00' # reserved
-            result	       += status.produce( data )
-            fc			= data.forward_close
-            result	       += UINT.produce( fc.connection_serial )
-            result	       += UINT.produce( fc.O_vendor )
-            result	       += UDINT.produce( fc.O_serial )
-
-            # The forward_close.application data in the reply is typed data, by default USINT.  It
-            # must be an even number of bytes, so pad it out if not.
-            app			= fc.setdefault( 'application', dotdict() )
-            if 'data' not in app:
-                app.data	= []
-            if app.data:
-                # Something has been provided
-                if 'type' not in app and 'tag_type' not in app:
-                    app.tag_type= USINT.tag_type
-                app.input	= typed_data.produce( app )
-                if len( app.input ) % 2:
-                    app.input  += b'\x00'
-                app.size	= len( app.input ) // 2 # words
-            else:
-                app.size	= 0
-
-            result	       += USINT.produce( app.size ) # application data size (words)
-            result	       += b'\x00' # pad
-            if app.size:
-                result	       += app.input
         else:
             result		= super( Message_Router, cls ).produce( data )
 
         return result
 
 class state_multiple_service( automata.state ):
-    """Find the specified target Object parser via the path specified, defaulting to the Message Router's parser (if any) in
-    play (eg. to parse reply), or the Logix' parser if no path (ie. we're just parsing a reply).
-    This requires that a Message_Router derived class has been instantiated that understands all
-    protocol elements that could be included in the Multiple Service Packet response (if the
-    EtherNet/IP dialect is not Logix)
+    """Find the specified target Object parser via the path specified, defaulting to the Message
+    Router's parser (if any) in play (eg. to parse reply), or the Logix' parser if no path
+    (ie. we're just parsing a reply).  This requires that a Message_Router derived class has been
+    instantiated that understands all protocol elements that could be included in the Multiple
+    Service Packet response (if the EtherNet/IP dialect is not Logix)
 
     """
     def terminate( self, exception, machine, path, data ):
@@ -2029,6 +1914,292 @@ Message_Router.register_service_parser( number=Message_Router.MULTIPLE_RPY, name
                                         short=Message_Router.MULTIPLE_CTX, machine=__multiple_reply() )
 
 
+class Connection_Manager( Object ):
+    """The Connection Manager (Class 0x06, Instance 1) Handles Unconnected Send (0x82) requests, such as:
+
+        "unconnected_send.service": 82, 
+        "unconnected_send.path.size": 2, 
+        "unconnected_send.path.segment[0].class": 6, 
+        "unconnected_send.path.segment[1].instance": 1, 
+        "unconnected_send.priority": 5, 
+        "unconnected_send.timeout_ticks": 157
+        "unconnected_send.length": 16, 
+        "unconnected_send.request.input": "array('B', [82, 4, 145, 5, 83, 67, 65, 68, 65, 0, 20, 0, 2, 0, 0, 0])", 
+        "unconnected_send.route_path.octets.input": "array('B', [1, 0, 1, 0])", 
+
+    If the message contains an request (.length > 0), we get the Message Router (Class 0x02,
+    Instance 1) to parse and process the request, eg:
+
+        "unconnected_send.request.service": 82, 
+        "unconnected_send.request.path.size": 4, 
+        "unconnected_send.request.path.segment[0].length": 5, 
+        "unconnected_send.request.path.segment[0].symbolic": "SCADA", 
+        "unconnected_send.request.read_frag.elements": 20, 
+        "unconnected_send.request.read_frag.offset": 2, 
+
+    We assume that the Message Router will convert the .request to a Response and fill it its .input
+    with the encoded response.
+
+    It also handles process of Forward Open requests.
+
+    """
+    class_id			= 0x06
+
+    # We only understand our own services; don't inherit from CIP Object (nor support
+    # post-processing of Multiple Service Packet closures)
+    service			= {} # Service number/name mappings
+    transit			= {} # Symbol to transition to service parser on
+    lock			= threading.Lock()
+    parser			= automata.dfa( service, initial=automata.state( 'CM svc' ),
+                                                terminal=True )
+
+    # A simple parser that parses only the .service and .path of a request, for routing purposes.
+    srvc			= USINT(	context='service' )
+    srvc[True]			= EPATH(	context='path',
+                                                terminal=True )
+    parser_service_path		= cpppo.dfa( 'target', initial=srvc, terminal=True )
+
+    FWD_OPEN_NAM		= "Forward Open"
+    FWD_OPEN_CTX		= "forward_open"
+    FWD_OPEN_REQ		= 0x54
+    FWD_OPEN_RPY		= FWD_OPEN_REQ | 0x80
+
+    FWD_CLOS_NAM		= "Forward Close"
+    FWD_CLOS_CTX		= "forward_close"
+    FWD_CLOS_REQ		= 0x4E
+    FWD_CLOS_RPY		= FWD_CLOS_REQ | 0x80
+
+    def forward_open( self, data ):
+        """Pretty much only the Connection Manager knows how to handle a Forward Open.  It'll come back to
+        us, for typical Forward Open requests with a path @0x02/1.  The Message_Router will
+        typically process the request, locate the Connection_Manager by its address, and dispatch
+        the forward_open request.
+
+        Dispatch a parsed Forward Open request, converting the 'data' dotdict contents to an
+        appropriate response.  Particularly, ensure that data.status reflects the CIP error status
+        of the request.
+
+        This base class implementation does nothing but report success (returning the appropriate
+        bits of the request, and pick a random T->O Connection ID.
+
+        """
+        fo			= data.forward_open
+        fo.T_O_connection_ID	= random.randint( 0, 2**32-1 )
+        fo.O_T_API		= fo.O_T_RPI
+        fo.T_O_API		= fo.T_O_RPI
+        data.status		= 0
+        if log.isEnabledFor( logging.NORMAL ):
+            log.normal( "%s Forward Open: %s", self, enip_format( data ))
+
+    def forward_close( self, data ):
+        data.status		= 0
+    
+    def request( self, data ):
+        """Handles an unparsed request.input, parses it and processes the request with the Message
+        Router @6/1 (probably). Must parse the .service code and .path to know for certain what the
+        target is. Some encapsulated service requests (eg. Forward Open) actually target the
+        Connection_Manager @2/1.  Each CIP request should always start with the SINT Service Code
+        followed by an EPATH.
+
+        """
+        if self.FWD_OPEN_CTX in data and data.setdefault( 'service', self.FWD_OPEN_REQ ) == self.FWD_OPEN_REQ:
+            # The only request a Connection Manager handles directly is the Forward Open.
+            try:
+                # Forward Open.  Parsed here (until we get proper "split" parsing for CIP requests,
+                # where service and EPATH is parsed centrally, then remainder of parsering is
+                # dispatched to the correct target Object?)  The Message Router will normally
+                # forward it here to the Connection Manager (where it was addressed) to be handled.
+                data.service   |= 0x80
+                data.status	= 8			# Service not supported, if anything blows up
+                self.forward_open( data )
+            except Exception as exc:
+                # On Exception, if we haven't specified a more detailed error code, return General
+                # Error.  Remember: 0x06 (Insufficent Packet Space) is a NORMAL response to a successful
+                # Read Tag Fragmented that returns a subset of the requested data.
+                log.normal( "%r Service 0x%02x %s failed with Exception: %s\nRequest: %s\n%s", self,
+                             data.service if 'service' in data else 0,
+                             ( self.service[data.service]
+                               if 'service' in data and data.service in self.service
+                               else "(Unknown)"), exc, enip_format( data ),
+                             ( '' if log.getEffectiveLevel() >= logging.NORMAL # is at/below NORMAL
+                               else ''.join( traceback.format_exception( *sys.exc_info() ))))
+                assert data.status, \
+                  "Implementation error: must specify non-zero .status before raising Exception!"
+
+            # Always produce a response payload; if a failure occurred, will contain an error status
+            if log.isEnabledFor( logging.DETAIL ):
+                log.detail( "%s Response: Service 0x%02x %s %s", self,
+                            data.service if 'service' in data else 0,
+                            ( self.service[data.service]
+                              if 'service' in data and data.service in self.service
+                              else "(Unknown)"), enip_format( data ))
+            data.input		= bytearray( self.produce( data ))
+            return True
+
+        # Must be an Unconnected Send (Send RR Data, 0x52) or a Connected Send (Send Unit Data).
+
+        # We don't check for Unconnected Send 0x52, because replies (and some requests) don't
+        # include the full wrapper, just the raw command.  This is quite confusing; especially since
+        # some of the commands have the same code (eg. Read Tag Fragmented, 0x52).  Of course, their
+        # replies don't (0x52|0x80 == 0xd2).  The CIP.produce recognizes the absence of the
+        # .command, and simply copies the encapsulated request.input as the response payload.  We
+        # don't encode the response here; it is done by the UCMM.
+        assert 'request' in data and 'input' in data.request, \
+            "Unconnected Send message with absent or empty request: %s\nvia: %s" % (
+                enip_format( data ), ''.join( traceback.format_stack() ))
+
+        if log.isEnabledFor( logging.INFO ):
+            log.info( "%s Request: %s", self, enip_format( data ))
+
+        # Get the Message Router to parse and process the request into a response, producing a
+        # data.request.input encoded response, which we will pass back as our own encoded response.
+        try:
+            source		= automata.rememberable( data.request.input )
+            target		= cpppo.dotdict()
+            with self.parser_service_path as machine:
+                for i,(m,s) in enumerate( machine.run( source=source, data=target )):
+                    pass
+            if log.isEnabledFor( logging.DETAIL ):
+                log.info( "%s Routing request to target Object at address %s", self, enip_format( target ))
+            # We have the service and path. Find the target Object
+            O			= lookup( class_id	= target.path.segment[0]['class'],
+                                          instance_id	= target.path.segment[1]['instance'] )
+            assert O, "Unknown CIP Object in request: %s" % ( enip_format( target ))
+            source		= automata.rememberable( data.request.input )
+            with O.parser as machine:
+                for i,(m,s) in enumerate( machine.run( path='request', source=source, data=data )):
+                    pass
+                    #log.detail( "%s #%3d -> %10.10s; next byte %3d: %-10.10r: %s",
+                    #            machine.name_centered(), i, s, source.sent, source.peek(),
+                    #            repr( data ) if log.getEffectiveLevel() < logging.DETAIL else misc.reprlib.repr( data ))
+
+            O.request( data.request )
+        except:
+            # Parsing failure.  We're done.  Suck out some remaining input to give us some context.
+            processed		= source.sent
+            memory		= bytes(bytearray(source.memory))
+            pos			= len( source.memory )
+            future		= bytes(bytearray( b for b in source ))
+            where		= "at %d total bytes:\n%s\n%s (byte %d)" % (
+                processed, repr(memory+future), '-' * (len(repr(memory))-1) + '^', pos )
+            log.error( "EtherNet/IP CIP error %s\n", where )
+            raise
+
+        if log.isEnabledFor( logging.INFO ):
+            log.info( "%s Response: %s", self, enip_format( data ))
+        return True
+
+    @classmethod
+    def produce( cls, data ):
+        result			= b''
+        if cls.FWD_OPEN_CTX in data and data.setdefault( 'service', cls.FWD_OPEN_REQ ) == cls.FWD_OPEN_REQ:
+            if log.isEnabledFor( logging.DETAIL ):
+                log.detail( "%s producing Forward Open Request: %s", cls.__name__, enip_format( data ))
+            result	       += USINT.produce( data.service )
+            result	       += EPATH.produce( data.path )
+            fo			= data.forward_open
+            result	       += USINT.produce( fo.priority_time_tick )
+            result	       += USINT.produce( fo.timeout_ticks )
+            result	       += UDINT.produce( fo.O_T_connection_ID )
+            result	       += UDINT.produce( fo.T_O_connection_ID )
+            result	       += UINT.produce( fo.connection_serial )
+            result	       += UINT.produce( fo.O_vendor )
+            result	       += UDINT.produce( fo.O_serial )
+            result	       += USINT.produce( fo.connection_timeout_multiplier )
+            result	       += b'\x00' * 3 # reserved
+            result	       += UDINT.produce( fo.O_T_RPI )
+            result	       += WORD.produce( fo.O_T_NCP )
+            result	       += UDINT.produce( fo.T_O_RPI )
+            result	       += WORD.produce( fo.T_O_NCP )
+            result	       += USINT.produce( fo.transport_class_triggers )
+            result	       += EPATH.produce( fo.connection_path )
+
+        elif data.get( 'service' ) == cls.FWD_OPEN_RPY:
+            if log.isEnabledFor( logging.DETAIL ):
+                log.detail( "%s producing Forward Open Reply: %s", cls.__name__, enip_format( data ))
+            result	       += USINT.produce( data.service )
+            result	       += b'\x00' # reserved
+            result	       += status.produce( data )
+            fo			= data.forward_open
+            result	       += UDINT.produce( fo.O_T_connection_ID )
+            result	       += UDINT.produce( fo.T_O_connection_ID )
+            result	       += UINT.produce( fo.connection_serial )
+            result	       += UINT.produce( fo.O_vendor )
+            result	       += UDINT.produce( fo.O_serial )
+            result	       += UDINT.produce( fo.O_T_API )
+            result	       += UDINT.produce( fo.T_O_API )
+
+            # The forward_open.application data in the reply is typed data, by default USINT.  It
+            # must be an even number of bytes, so pad it out if not.
+            app			= fo.setdefault( 'application', dotdict() )
+            if 'data' not in app:
+                app.data	= []
+            if app.data:
+                # Something has been provided
+                if 'type' not in app and 'tag_type' not in app:
+                    app.tag_type= USINT.tag_type
+                app.input	= typed_data.produce( app )
+                if len( app.input ) % 2:
+                    app.input  += b'\x00'
+                app.size	= len( app.input ) // 2 # words
+            else:
+                app.size	= 0
+
+            result	       += USINT.produce( app.size ) # application data size (words)
+            result	       += b'\x00' # pad
+            if app.size:
+                result	       += app.input
+
+        elif cls.FWD_CLOS_CTX in data and data.setdefault( 'service', cls.FWD_CLOS_REQ ) == cls.FWD_CLOS_REQ:
+            if log.isEnabledFor( logging.DETAIL ):
+                log.detail( "%s producing Forward Close Request: %s", cls.__name__, enip_format( data ))
+            result	       += USINT.produce( data.service )
+            result	       += EPATH.produce( data.path )
+            fc			= data.forward_close
+            result	       += USINT.produce( fc.priority_time_tick )
+            result	       += USINT.produce( fc.timeout_ticks )
+            result	       += UINT.produce( fc.connection_serial )
+            result	       += UINT.produce( fc.O_vendor )
+            result	       += UDINT.produce( fc.O_serial )
+            result	       += EPATH_padded.produce( fc.connection_path )
+
+        elif data.get( 'service' ) == cls.FWD_CLOS_RPY:
+            if log.isEnabledFor( logging.DETAIL ):
+                log.detail( "%s producing Forward Close Reply: %s", cls.__name__, enip_format( data ))
+            result	       += USINT.produce( data.service )
+            result	       += b'\x00' # reserved
+            result	       += status.produce( data )
+            fc			= data.forward_close
+            result	       += UINT.produce( fc.connection_serial )
+            result	       += UINT.produce( fc.O_vendor )
+            result	       += UDINT.produce( fc.O_serial )
+
+            # The forward_close.application data in the reply is typed data, by default USINT.  It
+            # must be an even number of bytes, so pad it out if not.
+            app			= fc.setdefault( 'application', dotdict() )
+            if 'data' not in app:
+                app.data	= []
+            if app.data:
+                # Something has been provided
+                if 'type' not in app and 'tag_type' not in app:
+                    app.tag_type= USINT.tag_type
+                app.input	= typed_data.produce( app )
+                if len( app.input ) % 2:
+                    app.input  += b'\x00'
+                app.size	= len( app.input ) // 2 # words
+            else:
+                app.size	= 0
+
+            result	       += USINT.produce( app.size ) # application data size (words)
+            result	       += b'\x00' # pad
+            if app.size:
+                result	       += app.input
+        else:
+            # Connection Manager only recognizes its own services (not the generic CIP Object's)
+            raise AssertionError( "%s doesn't recognize request/reply format: %r" % ( cls.__name__, data ))
+        return result
+
+
 def __forward_open():
     """Handle Forward Open request.
     """
@@ -2053,8 +2224,8 @@ def __forward_open():
                                                     terminal=True )
     return srvc
 
-Message_Router.register_service_parser( number=Message_Router.FWD_OPEN_REQ, name=Message_Router.FWD_OPEN_NAM,
-                                        short=Message_Router.FWD_OPEN_CTX, machine=__forward_open() )
+Connection_Manager.register_service_parser( number=Connection_Manager.FWD_OPEN_REQ, name=Connection_Manager.FWD_OPEN_NAM,
+                                            short=Connection_Manager.FWD_OPEN_CTX, machine=__forward_open() )
 
 def __forward_open_reply():
     srvc			= USINT(	context='service' )
@@ -2089,8 +2260,8 @@ def __forward_open_reply():
                                                 terminal=True )
     return srvc
 
-Message_Router.register_service_parser( number=Message_Router.FWD_OPEN_RPY, name=Message_Router.FWD_OPEN_NAM + " Reply",
-                                        short=Message_Router.FWD_OPEN_CTX, machine=__forward_open_reply() )
+Connection_Manager.register_service_parser( number=Connection_Manager.FWD_OPEN_RPY, name=Connection_Manager.FWD_OPEN_NAM + " Reply",
+                                            short=Connection_Manager.FWD_OPEN_CTX, machine=__forward_open_reply() )
 
 
 def __forward_close():
@@ -2110,8 +2281,8 @@ def __forward_close():
                                                     terminal=True )
     return srvc
 
-Message_Router.register_service_parser( number=Message_Router.FWD_CLOS_REQ, name=Message_Router.FWD_CLOS_NAM,
-                                        short=Message_Router.FWD_CLOS_CTX, machine=__forward_close() )
+Connection_Manager.register_service_parser( number=Connection_Manager.FWD_CLOS_REQ, name=Connection_Manager.FWD_CLOS_NAM,
+                                            short=Connection_Manager.FWD_CLOS_CTX, machine=__forward_close() )
 
 
 def __forward_close_reply():
@@ -2143,150 +2314,6 @@ def __forward_close_reply():
                                                 terminal=True )
     return srvc
 
-Message_Router.register_service_parser( number=Message_Router.FWD_CLOS_RPY, name=Message_Router.FWD_CLOS_NAM + " Reply",
-                                        short=Message_Router.FWD_CLOS_CTX, machine=__forward_close_reply() )
-
-
-class Connection_Manager( Object ):
-    """The Connection Manager (Class 0x06, Instance 1) Handles Unconnected Send (0x82) requests, such as:
-
-        "unconnected_send.service": 82, 
-        "unconnected_send.path.size": 2, 
-        "unconnected_send.path.segment[0].class": 6, 
-        "unconnected_send.path.segment[1].instance": 1, 
-        "unconnected_send.priority": 5, 
-        "unconnected_send.timeout_ticks": 157
-        "unconnected_send.length": 16, 
-        "unconnected_send.request.input": "array('B', [82, 4, 145, 5, 83, 67, 65, 68, 65, 0, 20, 0, 2, 0, 0, 0])", 
-        "unconnected_send.route_path.octets.input": "array('B', [1, 0, 1, 0])", 
-
-    If the message contains an request (.length > 0), we get the Message Router (Class 0x02,
-    Instance 1) to parse and process the request, eg:
-
-        "unconnected_send.request.service": 82, 
-        "unconnected_send.request.path.size": 4, 
-        "unconnected_send.request.path.segment[0].length": 5, 
-        "unconnected_send.request.path.segment[0].symbolic": "SCADA", 
-        "unconnected_send.request.read_frag.elements": 20, 
-        "unconnected_send.request.read_frag.offset": 2, 
-
-    We assume that the Message Router will convert the .request to a Response and fill it its .input
-    with the encoded response.
-
-    It also handles process of Forward Open requests.
-
-    """
-    class_id			= 0x06
-
-    def forward_open( self, data ):
-        """Pretty much only the Connection Manager knows how to handle a Forward Open.  It'll come back to
-        us, for typical Forward Open requests with a path @0x02/1.  The Message_Router will
-        typically process the request, locate the Connection_Manager by its address, and dispatch
-        the forward_open request.
-
-        Dispatch a parsed Forward Open request, converting the 'data' dotdict contents to an
-        appropriate response.  Particularly, ensure that data.status reflects the CIP error status
-        of the request.
-
-        This base class implementation does nothing but report success (returning the appropriate
-        bits of the request, and pick a random T->O Connection ID.
-
-        """
-        fo			= data.forward_open
-        fo.T_O_connection_ID	= random.randint( 0, 2**32-1 )
-        fo.O_T_API		= fo.O_T_RPI
-        fo.T_O_API		= fo.T_O_RPI
-        data.status		= 0
-        if log.isEnabledFor( logging.NORMAL ):
-            log.normal( "%s Forward Open: %s", self, enip_format( data ))
-
-    def forward_close( self, data ):
-        data.status		= 0
-    
-    def request( self, data ):
-        """
-        Handles an unparsed request.input, parses it and processes the request with the Message Router.
-
-        """
-        MR			= lookup( class_id=Message_Router.class_id, instance_id=1 )
- 
-        if MR.FWD_OPEN_CTX in data and data.setdefault( 'service', MR.FWD_OPEN_REQ ) == MR.FWD_OPEN_REQ:
-            # The only request a Connection Manager handles directly is the Forward Open.
-            try:
-                # Forward Open.  Parsed in Message Router (until we get proper "split" parsing for CIP
-                # requests, where service and EPATH is parsed centrally, then remainder of parsering is
-                # dispatched to the correct target Object.)  The Message Router will normally forward it
-                # here to the Connection Manager (where it was addressed) to be handled.
-                data.service   |= 0x80
-                data.status	= 8			# Service not supported, if anything blows up
-                self.forward_open( data )
-            except Exception as exc:
-                # On Exception, if we haven't specified a more detailed error code, return General
-                # Error.  Remember: 0x06 (Insufficent Packet Space) is a NORMAL response to a successful
-                # Read Tag Fragmented that returns a subset of the requested data.
-                log.normal( "%r Service 0x%02x %s failed with Exception: %s\nRequest: %s\n%s", self,
-                             data.service if 'service' in data else 0,
-                             ( self.service[data.service]
-                               if 'service' in data and data.service in self.service
-                               else "(Unknown)"), exc, enip_format( data ),
-                             ( '' if log.getEffectiveLevel() >= logging.NORMAL
-                               else ''.join( traceback.format_exception( *sys.exc_info() ))))
-                assert data.status, \
-                  "Implementation error: must specify non-zero .status before raising Exception!"
-
-            # Always produce a response payload; if a failure occurred, will contain an error status
-            # Uses the Message Router, which knows about parsing the Forward Open, but not executing it.
-            if log.isEnabledFor( logging.DETAIL ):
-                log.detail( "%s Response: Service 0x%02x %s %s", self,
-                            data.service if 'service' in data else 0,
-                            ( self.service[data.service]
-                              if 'service' in data and data.service in self.service
-                              else "(Unknown)"), enip_format( data ))
-            data.input		= bytearray( MR.produce( data ))
-            return True
-
-        # Must be an Unconnected Send (Send RR Data, 0x52) or a Connected Send (Send Unit Data).
-
-        # We don't check for Unconnected Send 0x52, because replies (and some requests) don't
-        # include the full wrapper, just the raw command.  This is quite confusing; especially since
-        # some of the commands have the same code (eg. Read Tag Fragmented, 0x52).  Of course, their
-        # replies don't (0x52|0x80 == 0xd2).  The CIP.produce recognizes the absence of the
-        # .command, and simply copies the encapsulated request.input as the response payload.  We
-        # don't encode the response here; it is done by the UCMM.
-        assert 'request' in data and 'input' in data.request, \
-            "Unconnected Send message with absent or empty request: %s\nvia: %s" % (
-                enip_format( data ), ''.join( traceback.format_stack() ))
-
-        if log.isEnabledFor( logging.INFO ):
-            log.info( "%s Request: %s", self, enip_format( data ))
-
-        #log.info( "%s Parsing: %s", self, enip_format( data.request ))
-        # Get the Message Router to parse and process the request into a response, producing a
-        # data.request.input encoded response, which we will pass back as our own encoded response.
-        MR			= lookup( class_id=Message_Router.class_id, instance_id=1 )
-        source			= automata.rememberable( data.request.input )
-        try: 
-            with MR.parser as machine:
-                for i,(m,s) in enumerate( machine.run( path='request', source=source, data=data )):
-                    pass
-                    #log.detail( "%s #%3d -> %10.10s; next byte %3d: %-10.10r: %s",
-                    #            machine.name_centered(), i, s, source.sent, source.peek(),
-                    #            repr( data ) if log.getEffectiveLevel() < logging.DETAIL else misc.reprlib.repr( data ))
-
-            #log.info( "%s Executing: %s", self, enip_format( data.request ))
-            MR.request( data.request )
-        except:
-            # Parsing failure.  We're done.  Suck out some remaining input to give us some context.
-            processed		= source.sent
-            memory		= bytes(bytearray(source.memory))
-            pos			= len( source.memory )
-            future		= bytes(bytearray( b for b in source ))
-            where		= "at %d total bytes:\n%s\n%s (byte %d)" % (
-                processed, repr(memory+future), '-' * (len(repr(memory))-1) + '^', pos )
-            log.error( "EtherNet/IP CIP error %s\n", where )
-            raise
-
-        if log.isEnabledFor( logging.INFO ):
-            log.info( "%s Response: %s", self, enip_format( data ))
-        return True
+Connection_Manager.register_service_parser( number=Connection_Manager.FWD_CLOS_RPY, name=Connection_Manager.FWD_CLOS_NAM + " Reply",
+                                            short=Connection_Manager.FWD_CLOS_CTX, machine=__forward_close_reply() )
 

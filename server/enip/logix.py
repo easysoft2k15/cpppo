@@ -811,5 +811,7 @@ def process( addr, data, **kwds ):
         future			= bytes(bytearray( b for b in source ))
         where			= "at %d total bytes:\n%s\n%s (byte %d)" % (
             processed, repr(memory+future), '-' * (len(repr(memory))-1) + '^', pos )
-        log.error( "EtherNet/IP CIP error %s\n", where )
+        log.error( "EtherNet/IP CIP error %s\n%s", where,
+                   ( '' if log.getEffectiveLevel() >= logging.NORMAL
+                     else ''.join( traceback.format_exception( *sys.exc_info() ))))
         raise
