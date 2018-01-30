@@ -317,6 +317,11 @@ class client( object ):
         self.addr_connected	= not ( udp and broadcast )
         self.conn		= None
         self.udp		= udp
+        self.dialect		= dialect # May be (temporarily) changed
+        # If provided, we'll disable/enable a profiler around the I/O code, to avoid corrupting the
+        # profile data with arbitrary I/O related delays
+        self.profiler		= profiler
+
         log.detail( "Connect:  %s/IP to %r", "UPD" if udp else "TCP", self.addr )
         if self.udp:
             try:
@@ -359,15 +364,19 @@ class client( object ):
         self.frame		= enip.enip_machine( terminal=True )
         self.cip		= enip.CIP( terminal=True )	# Parses a CIP   request in an EtherNet/IP frame
 
-        # Ensure the requested dialect matches the globally selected dialect; Default to Logix
+        # Ensure the requested dialect matches the globally selected dialect; Default to Logix. An
+        # EtherNet/IP CIP "server" receives requests containing a .path identifying the target
+        # Object (and its parser). The client doesn't have this when parsing responses; only when
+        # producing requests. Since the responses are parsed asynchronously and then matched up with
+        # the corresponding request alter (for pipelining), we need to remember a default
+        # parser. Normally, this will be a Message Router derived class (eg. logix.Logix). However,
+        # for some requests (eg. Forward Open), the target is the Connection Manager; we'll
+        # (temporarily) change the client.dialect while parsing these requests.
         if device.dialect is None:
             device.dialect	= logix.Logix if dialect is None else dialect
         if dialect is not None:
             assert device.dialect is dialect, \
                 "Inconsistent EtherNet/IP dialect requested: %r (vs. default: %r)" % ( dialect, device.dialect )
-        # If provided, we'll disable/enable a profiler around the I/O code, to avoid corrupting the
-        # profile data with arbitrary I/O related delays
-        self.profiler		= profiler
 
     def __str__( self ):
         return "%s:%s[%r]" % ( self.addr[0], self.addr[1], self.session )
@@ -508,9 +517,10 @@ class client( object ):
         # zero, it's status probably indicates why.
         if result is not None and 'enip.input' in result:
             with self.cip as machine:
-                for mch,sta in machine.run(
-                        path='enip', source=cpppo.peekable( result.enip.input ), data=result ):
-                    pass
+                with contextlib.closing( machine.run(
+                        path='enip', source=cpppo.peekable( result.enip.input ), data=result )) as engine:
+                    for m,s in engine:
+                        pass
                 assert machine.terminal, "No CIP payload in the EtherNet/IP frame: %r" % ( result )
 
         # Parse the device (eg. Logix) request responses in the EtherNet/IP CIP payload's CPF items
@@ -520,11 +530,12 @@ class client( object ):
                     # An Unconnected Send that contained an encapsulated request (ie. not just a Get
                     # Attribute All).  Use the globally-defined cpppo.server.enip.client's dialect's
                     # (eg. logix.Logix) parser to parse the contents of the CIP payload's CPF items.
-                    with device.dialect.parser as machine:
+                    dialect	= self.dialect or device.dialect # May be (temporarily) changed
+                    with dialect.parser as machine:
                         with contextlib.closing( machine.run( # for pypy, where gc may delay destruction of generators
                                 source=cpppo.peekable( item.unconnected_send.request.input ),
                                 data=item.unconnected_send.request )) as engine:
-                            for mch,sta in engine:
+                            for m,s in engine:
                                 pass
                             assert machine.terminal, "No %r request in the EtherNet/IP CIP CPF frame: %r" % (
                                 device.dialect, result )
@@ -616,7 +627,10 @@ class client( object ):
                       timeout=None, send=True,
                       route_path=False, send_path='', sender_context=b'',
                       **kwds ):
-        """Forward Open uses a CPF encapsulation, but with no route_path or send_path"""
+        """Forward Open uses a CPF encapsulation, but with no route_path or send_path.  Must be used
+        with a self.dialect == Connection_Manager to properly produce request and parse response.
+
+        """
         req			= cpppo.dotdict()
         req.path		= { 'segment': [ cpppo.dotdict( d ) for d in parse_path( path ) ]}
         req.forward_open 	= {}
@@ -635,17 +649,33 @@ class client( object ):
         fo.transport_class_triggers = transport_class_triggers
         fo.connection_timeout_multiplier = connection_timeout_multiplier
         fo.connection_path	= { 'segment': [ cpppo.dotdict( d ) for d in parse_path( connection_path ) ]}
-
         if send:
             self.unconnected_send(
                 request=req, route_path=route_path, send_path=send_path, timeout=timeout,
-                sender_context=sender_context, dialect=device.Connection_Manager )
+                sender_context=sender_context )
         return req
 
     def forward_close( self, path, connection_path,
-                      priority_time_tick, timeout_ticks,
-                      O_serial, O_vendor, connection_serial ):
-        pass
+                       priority_time_tick, timeout_ticks,
+                       O_serial, O_vendor, connection_serial,
+                       timeout=None, send=True,
+                       route_path=False, send_path='', sender_context=b'' ):
+        req			= cpppo.dotdict()
+        req.path		= { 'segment': [ cpppo.dotdict( d ) for d in parse_path( path ) ]}
+        req.forward_close 	= {}
+        fc			= req.forward_close
+        fc.priority_time_tick	= priority_time_tick
+        fc.timeout_ticks	= timeout_ticks
+        fc.connection_serial	= connection_serial
+        fc.O_vendor		= O_vendor
+        fc.O_serial		= O_serial
+        fc.connection_path	= { 'segment': [ cpppo.dotdict( d ) for d in parse_path( connection_path ) ]}
+        if send:
+            self.unconnected_send(
+                request=req, route_path=route_path, send_path=send_path, timeout=timeout,
+                sender_context=sender_context )
+        return req
+
 
     def service_code( self, code, path, data=None, elements=None, tag_type=None,
                 route_path=None, send_path=None, timeout=None, send=True,
@@ -849,7 +879,7 @@ class client( object ):
             # Default to the Connection Manager
             send_path		= self.send_path_default
         if dialect is None:
-            dialect		= device.dialect
+            dialect		= self.dialect or device.dialect # May be (temporarily) changed
 
         cip			= cpppo.dotdict()
         cip.send_data		= {}
@@ -901,11 +931,12 @@ class client( object ):
         If payload is a dict, we'll try to produce it; otherwise, assumes request is an opaque byte
         string.
 
+        Uses dialect, self.dialect or device.dialect (in that order).
         """
         # The payload is an opaque byte string; we probably don't know how to en/decode it.
         # However, if dict is provided, we'll try.
         if dialect is None:
-            dialect		= device.dialect
+            dialect		= self.dialect or device.dialect
         if isinstance( request, dict ):
             payload		= bytearray( dialect.produce( request ))
         else:
@@ -1568,8 +1599,12 @@ class implicit( connector ):
         self.timeout		= timeout
         self.requested		= cpppo.dotdict()
         self.established	= cpppo.dotdict()
+
+        super( implicit, self ).__init__( host=host, port=port, timeout=timeout, **kwds )
+
+        # Substitute Connection_Manager for response parsing for duration of Forward Open
+        dialect_bak,self.dialect= self.dialect,device.Connection_Manager
         try:
-            super( implicit, self ).__init__( host=host, port=port, timeout=timeout, **kwds )
             assert not self.udp, "Cannot establish Implicit UDP EtherNet/IP CIP connections"
             self.__class__.connection_serial += 1
 
@@ -1627,6 +1662,7 @@ class implicit( connector ):
                     timeout		= None if timeout is None else max( 0, timeout - elapsed_req ),
                     route_path		= route_path,
                     send_path		= send_path )
+
                 # Await the CIP response for remainder of timeout
                 elapsed_req	= cpppo.timer() - begun
                 data,elapsed_rpy= await( self, timeout=None if timeout is None else max( 0, timeout - elapsed_req ))
@@ -1639,7 +1675,6 @@ class implicit( connector ):
             self.established		= data.get( 'enip.CIP.send_data.CPF.item[1].unconnected_send.request' )
             assert self.established and 'forward_open' in self.established and self.established.status == 0, \
                 "Failed to receive successful Forward Open response: %s" % ( enip.enip_format( self.established ))
-            
         except Exception as exc:
             log.normal( "FwdOpen:  Failure in %7.3fs/%7.3fs: %s", cpppo.timer() - begun,
                         cpppo.inf if timeout is None else timeout, exc )
@@ -1647,30 +1682,47 @@ class implicit( connector ):
         else:
             log.normal( "FwdOpen:  Success in %7.3fs/%7.3fs", cpppo.timer() - begun,
                         cpppo.inf if timeout is None else timeout )
+        finally:
+            self.dialect	= dialect_bak # Restore original self.dialect
 
     def close( self ):
         """Attempt to cleanly close the Implicit Forward Opened connection by sending a corresponding
-        Forward Close.  If it fails, capture and log the failure, but continue with the close, as
-        this is often executed as part of the destruction of a connection.  We will use the values
-        returned in the Forward Open response saved in self.established, and the original
-        connection_path saved in self.connection_path.
+        Forward Close, followed immediately by a shutdown the socket.  If it fails, capture and log
+        the failure, but continue with the close, as this is often executed as part of the
+        destruction of a connection.  We will use the values returned in the Forward Open response
+        saved in self.established, and the original connection_path, etc. saved in self.requested.
 
         Since we can't have a constructed object unless the original Forward Open succeeded, we can
-        assume that we must perform the Forward Close.  If the socket has already been closed, this
-        will fail immediately.
+        assume that we must perform the Forward Close; actually, there are -- __del__ (and hence
+        .close()) is invoked on partially constructed objects.
+
+        If the socket has already been closed, this will fail immediately with a socket.error EPIPE.
+        In general, the caller may want to ignore failures due to socket errors on closing; if the
+        Python object is allowed to be destructed normally, exceptions raised during __del__
+        invocation are ignored.  However, if you invoke close directly, be prepared to handle an
+        Exception in the (likely) case that the socket has already closed.
 
         """
         begun			= cpppo.timer()
+        dialect_bak,self.dialect= self.dialect,device.Connection_Manager
         try:
-            assert 'forward_open' in self.established and self.established.forward_open.status == 0, \
-                "No Forward Open; not executing Forward Close"
+            if 'forward_open' not in self.established or self.established.status != 0:
+                if log.isEnabledFor( logging.INFO ):
+                    log.info( "No Forward Open; not executing Forward Close: %s", enip.enip_format( self.established ))
+                return
+            if log.isEnabledFor( logging.DETAIL ):
+                log.detail( "Forward Close w/ \nRequested: %s, \nEstablished: %s",
+                            enip.enip_format( self.requested ), enip.enip_format( self.established ))
             with self:
                 self.forward_close(
-                    path		= self.requested.path['segment'],
-                    connection_path	= self.requested.connection_path['segment'],
+                    path		= self.requested.path.segment,
+                    connection_path	= self.requested.forward_open.connection_path.segment,
+                    timeout_ticks	= self.requested.forward_open.timeout_ticks,
+                    priority_time_tick	= self.requested.forward_open.priority_time_tick,
                     O_serial		= self.established.forward_open.O_serial,
                     O_vendor		= self.established.forward_open.O_vendor,
                     connection_serial	= self.established.forward_open.connection_serial )
+                self.shutdown()
                 # Await the CIP response for remainder of self.timeout
                 elapsed_req	= cpppo.timer() - begun
                 data,elapsed_rpy= await( self, timeout=None if self.timeout is None else max( 0, self.timeout - elapsed_req ))
@@ -1682,7 +1734,6 @@ class implicit( connector ):
             response			= data.get( 'enip.CIP.send_data.CPF.item[1].unconnected_send.request' )
             assert 'forward_close' in self.established and self.established.status == 0, \
                 "Failed to receive successful Forward Open response: %s" % ( enip_format( self.established ))
-            
         except Exception as exc:
             log.normal( "FwdClose: Failure in %7.3fs/%7.3fs: %s", cpppo.timer() - begun,
                         cpppo.inf if self.timeout is None else self.timeout, exc )
@@ -1691,6 +1742,7 @@ class implicit( connector ):
             log.normal( "FwdClose: Success in %7.3fs/%7.3fs", cpppo.timer() - begun,
                         cpppo.inf if self.timeout is None else self.timeout )
         finally:
+            self.dialect	= dialect_bak # Restore original self.dialect
             super( implicit, self ).close()
 
 

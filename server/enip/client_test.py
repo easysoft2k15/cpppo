@@ -162,9 +162,9 @@ def test_client_api_simple():
             req			= connection.service_code(
                 code=enip.Object.GA_SNG_REQ, path='@0x99/1/2' )
             assert 'service_code' in req and req.service_code is True # no payload
-            assert connection.readable( timeout=1.0 ) # receive reply
+            assert connection.readable( timeout=10.0 ) # receive reply
             rpy			= next( connection )
-            assert 'enip.CIP' in rpy and 'send_data.CPF.item[1].unconnected_send.request.get_attribute_single' in rpy.enip.CIP
+            assert rpy and 'enip.CIP' in rpy and 'send_data.CPF.item[1].unconnected_send.request.get_attribute_single' in rpy.enip.CIP
 
             # Set Attribute Single's payload is an EPATH + USINT data
             req			= connection.service_code(
@@ -173,24 +173,36 @@ def test_client_api_simple():
                     #enip.EPATH.produce( enip.parse_path( '@0x99/1/2' )) +
                     enip.typed_data.produce( { 'data': list( map( float, range( taglen ))) }, tag_type=enip.REAL.tag_type ))))
             assert 'service_code' in req and isinstance( req.service_code, dict ) and 'data' in req.service_code
-            assert connection.readable( timeout=1.0 ) # receive reply
+            assert connection.readable( timeout=10.0 ) # receive reply
             rpy			= next( connection )
-            assert 'enip.CIP' in rpy and 'send_data.CPF.item[1].unconnected_send.request.set_attribute_single' in rpy.enip.CIP
+            assert rpy and 'enip.CIP' in rpy and 'send_data.CPF.item[1].unconnected_send.request.set_attribute_single' in rpy.enip.CIP
 
+            '''
             # Try to send some PCCC I/O
             req		= connection.connected_send( b'\x00\x00\x01\x00\x00\x00\x00\x00\x06\x00\x4a\x0a\x03',
                                                      connection=0x8dee0016, sequence=1 )
             logging.normal("PCCC Request: %s", enip.enip_format( req ))
             #assert 'service_code' in req and req.service_code is True # no payload
-            assert connection.readable( timeout=1.0 ) # receive reply
+            assert connection.readable( timeout=10.0 ) # receive reply
             rpy			= next( connection )
             logging.normal("PCCC Response: %s", enip.enip_format( rpy )) # will be EtherNet/IP status 8; nothing implemented
+            '''
 
-
-        connection.shutdown()
-        assert connection.readable( timeout=1.0 ) # receive EOF
-        connection.close()
-
+        if random.randint( 0, 1 ):
+            # Try a clean shutdown, closing the outgoing half of the socket, leading to an EOF on
+            # the server.  This will cause the subsequent Forward Close to fail w/ an EPIPE
+            logging.normal( "Skip Forward Close; send EOF" )
+            connection.shutdown()
+            assert connection.readable( timeout=1.0 ) # receive EOF
+            try:
+                connection.close()
+            except socket.error as exc:
+                if exc.errno != errno.EPIPE:
+                    raise
+        else:
+            # Normal close procedure; send Forward Close + EOF, receive Forward Close + EOF.
+            logging.normal( "Send Forward Close; then EOF" )
+            del connection
     finally:
         control			= server_kwds.get( 'server', {} ).get( 'control', {} ) if server_kwds else {}
         if 'done' in control:

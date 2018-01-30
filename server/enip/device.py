@@ -1816,8 +1816,9 @@ class state_multiple_service( automata.state ):
                 req.input	= reqdata[beg:end]
                 with target.parser as machine:
                     source	= automata.peekable( req.input )
-                    for m,s in machine.run( source=source, data=req ):
-                        pass
+                    with contextlib.closing( machine.run( source=source, data=req )) as engine:
+                        for m,s in engine:
+                            pass
                     assert machine.terminal, \
                         "%s: Failed to parse Multiple Service Packet request %d" % (
                             machine.name_centered(), oi )
@@ -2051,29 +2052,33 @@ class Connection_Manager( Object ):
         if log.isEnabledFor( logging.INFO ):
             log.info( "%s Request: %s", self, enip_format( data ))
 
-        # Get the Message Router to parse and process the request into a response, producing a
-        # data.request.input encoded response, which we will pass back as our own encoded response.
+        # Get the target object (usually a Message Router) to parse and process the request into a
+        # response, producing a data.request.input encoded response, which we will pass back as our
+        # own encoded response. Note that we assume, here, that we are dealing with CIP Requests
+        # (ie. a .service code without bit 0x80 set), thus always followed by an EPATH.
         try:
             source		= automata.rememberable( data.request.input )
-            target		= cpppo.dotdict()
+            targetdata		= cpppo.dotdict()
             with self.parser_service_path as machine:
-                for i,(m,s) in enumerate( machine.run( source=source, data=target )):
-                    pass
+                with contextlib.closing( machine.run( source=source, data=targetdata )) as engine:
+                    for i,(m,s) in enumerate( engine ):
+                        pass
             if log.isEnabledFor( logging.DETAIL ):
-                log.info( "%s Routing request to target Object at address %s", self, enip_format( target ))
-            # We have the service and path. Find the target Object
-            O			= lookup( class_id	= target.path.segment[0]['class'],
-                                          instance_id	= target.path.segment[1]['instance'] )
-            assert O, "Unknown CIP Object in request: %s" % ( enip_format( target ))
+                log.detail( "%s Routing request to target Object at address %s", self, enip_format( targetdata ))
+            # We have the service and path. Find the target Object (see state_multiple_service.closure)
+            ids			= resolve( targetdata.path )
+            target		= lookup( *ids )
+            assert target, "Unknown CIP Object in request: %s" % ( enip_format( targetdata ))
             source		= automata.rememberable( data.request.input )
-            with O.parser as machine:
-                for i,(m,s) in enumerate( machine.run( path='request', source=source, data=data )):
-                    pass
-                    #log.detail( "%s #%3d -> %10.10s; next byte %3d: %-10.10r: %s",
-                    #            machine.name_centered(), i, s, source.sent, source.peek(),
-                    #            repr( data ) if log.getEffectiveLevel() < logging.DETAIL else misc.reprlib.repr( data ))
+            with target.parser as machine:
+                with contextlib.closing(  machine.run( path='request', source=source, data=data )) as engine:
+                    for i,(m,s) in enumerate( engine ):
+                        pass
+                        #log.detail( "%s #%3d -> %10.10s; next byte %3d: %-10.10r: %s",
+                        #            machine.name_centered(), i, s, source.sent, source.peek(),
+                        #            repr( data ) if log.getEffectiveLevel() < logging.DETAIL else misc.reprlib.repr( data ))
 
-            O.request( data.request )
+            target.request( data.request )
         except:
             # Parsing failure.  We're done.  Suck out some remaining input to give us some context.
             processed		= source.sent
